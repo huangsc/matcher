@@ -1,153 +1,209 @@
 package matcher
 
 import (
+	"sort"
+	"sync"
 	"time"
 
 	"github.com/shopspring/decimal"
 )
 
+var (
+	tradePool = sync.Pool{
+		New: func() interface{} {
+			return &Trade{}
+		},
+	}
+)
+
 type OrderBook struct {
-	buyOrders  *PriceLevel
-	sellOrders *PriceLevel
+	buyLevels  []*PriceLevel
+	sellLevels []*PriceLevel
 }
 
 type PriceLevel struct {
-	Price  decimal.Decimal
-	Orders []*Order
-	Next   *PriceLevel
+	Price  decimal.Decimal // 买单按价格降序排列，卖单按价格升序排列
+	Orders []*Order        // 同一价格的订单按时间优先排序
 }
 
 func NewOrderBook() *OrderBook {
 	return &OrderBook{
-		buyOrders:  nil,
-		sellOrders: nil,
+		buyLevels:  make([]*PriceLevel, 0, 64),
+		sellLevels: make([]*PriceLevel, 0, 64),
+	}
+}
+
+func (ob *OrderBook) updateLevels(side OrderSide, levels []*PriceLevel) {
+	// 更新指定方向的价格档位，同时清理已完全成交的订单和空档位
+	if side == OrderSideBuy {
+		ob.sellLevels = levels
+	} else {
+		ob.buyLevels = levels
 	}
 }
 
 func (ob *OrderBook) Match(order *Order) []*Trade {
-	trades := make([]*Trade, 0)
+	trades := make([]*Trade, 0, 64)
 
-	var matchPrice *PriceLevel
+	var levels []*PriceLevel
 	if order.Side == OrderSideBuy {
-		matchPrice = ob.sellOrders
+		levels = ob.sellLevels
 	} else {
-		matchPrice = ob.buyOrders
+		levels = ob.buyLevels
 	}
 
-	// 撮合循环
-	for matchPrice != nil {
-		// 检查价格是否匹配
-		if !ob.isPriceMatch(order, matchPrice.Price) {
-			break
+	// 保持未空的价格档位
+	validLevels := make([]*PriceLevel, 0, len(levels))
+
+	for _, level := range levels {
+		if order.Side == OrderSideBuy && level.Price.GreaterThan(order.Price) {
+			validLevels = append(validLevels, level)
+			continue
+		}
+		if order.Side == OrderSideSell && level.Price.LessThan(order.Price) {
+			validLevels = append(validLevels, level)
+			continue
 		}
 
-		// 遍历该价格档位的所有订单
-		for i := 0; i < len(matchPrice.Orders); i++ {
-			matchOrder := matchPrice.Orders[i]
-
-			// 计算成交量
-			matchQty := decimal.Min(
-				order.RemainQuantity(),
-				matchOrder.RemainQuantity(),
-			)
-
-			if matchQty.IsZero() {
+		validOrders := make([]*Order, 0, len(level.Orders))
+		for _, matchOrder := range level.Orders {
+			if matchOrder.IsFullyFilled() {
 				continue
 			}
 
-			// 创建成交记录
-			trade := &Trade{
-				Price:     matchPrice.Price,
-				Quantity:  matchQty,
-				BuyOrder:  order,
-				SellOrder: matchOrder,
-				Timestamp: time.Now().UnixMilli(),
+			matchQty := decimal.Min(order.RemainQuantity(), matchOrder.RemainQuantity())
+			if matchQty.IsZero() {
+				validOrders = append(validOrders, matchOrder)
+				continue
 			}
+
+			trade := tradePool.Get().(*Trade)
+			trade.Price = level.Price
+			trade.Quantity = matchQty
+			trade.BuyOrder = order
+			trade.SellOrder = matchOrder
+			trade.Timestamp = time.Now().UnixMilli()
+
 			trades = append(trades, trade)
 
-			// 更新订单状态
 			order.FilledQuantity = order.FilledQuantity.Add(matchQty)
 			matchOrder.FilledQuantity = matchOrder.FilledQuantity.Add(matchQty)
 
-			// 检查是否完全成交
 			if order.IsFullyFilled() {
 				order.Status = OrderStatusFilled
-				break
+				if !matchOrder.IsFullyFilled() {
+					validOrders = append(validOrders, matchOrder)
+				}
+				level.Orders = validOrders
+				if len(validOrders) > 0 {
+					validLevels = append(validLevels, level)
+				}
+				ob.updateLevels(order.Side, validLevels)
+				return trades
+			}
+
+			if !matchOrder.IsFullyFilled() {
+				validOrders = append(validOrders, matchOrder)
 			}
 		}
 
-		matchPrice = matchPrice.Next
+		if len(validOrders) > 0 {
+			level.Orders = validOrders
+			validLevels = append(validLevels, level)
+		}
 	}
 
-	// 如果订单未完全成交，加入订单簿
 	if !order.IsFullyFilled() {
 		order.Status = OrderStatusPartial
+		ob.Add(order)
 	}
 
+	ob.updateLevels(order.Side, validLevels)
 	return trades
 }
 
-func (ob *OrderBook) isPriceMatch(order *Order, price decimal.Decimal) bool {
-	if order.Side == OrderSideBuy {
-		return order.Price.GreaterThanOrEqual(price)
-	}
-	return order.Price.LessThanOrEqual(price)
-}
-
 func (ob *OrderBook) Add(order *Order) {
-	// 根据订单方向添加到对应的订单簿中
+	var levels *[]*PriceLevel
 	if order.Side == OrderSideBuy {
-		ob.buyOrders = ob.buyOrders.Add(order)
+		levels = &ob.buyLevels
 	} else {
-		ob.sellOrders = ob.sellOrders.Add(order)
+		levels = &ob.sellLevels
 	}
+
+	// 快速路径：如果是空的或者应该放在末尾
+	if len(*levels) == 0 || (order.Side == OrderSideBuy && order.Price.LessThan((*levels)[len(*levels)-1].Price)) ||
+		(order.Side == OrderSideSell && order.Price.GreaterThan((*levels)[len(*levels)-1].Price)) {
+		*levels = append(*levels, &PriceLevel{
+			Price:  order.Price,
+			Orders: []*Order{order},
+		})
+		return
+	}
+
+	// 快速路径：如果应该放在开头
+	if (order.Side == OrderSideBuy && order.Price.GreaterThan((*levels)[0].Price)) ||
+		(order.Side == OrderSideSell && order.Price.LessThan((*levels)[0].Price)) {
+		*levels = append([]*PriceLevel{{
+			Price:  order.Price,
+			Orders: []*Order{order},
+		}}, (*levels)...)
+		return
+	}
+
+	// 二分查找
+	idx := sort.Search(len(*levels), func(i int) bool {
+		if order.Side == OrderSideBuy {
+			return (*levels)[i].Price.LessThan(order.Price)
+		}
+		return (*levels)[i].Price.GreaterThan(order.Price)
+	})
+
+	// 如果找到相同价格
+	if idx > 0 && (*levels)[idx-1].Price.Equal(order.Price) {
+		(*levels)[idx-1].Orders = append((*levels)[idx-1].Orders, order)
+		return
+	}
+
+	// 插入新价格档位
+	newLevel := &PriceLevel{
+		Price:  order.Price,
+		Orders: []*Order{order},
+	}
+
+	*levels = append(*levels, nil)
+	copy((*levels)[idx+1:], (*levels)[idx:])
+	(*levels)[idx] = newLevel
 }
 
 func (ob *OrderBook) Remove(orderID string) bool {
-	// 根据订单方向从对应的订单簿中移除订单
-	if ob.buyOrders != nil && ob.buyOrders.Orders != nil {
-		for i, order := range ob.buyOrders.Orders {
-			if order.ID == orderID {
-				ob.buyOrders.Orders = append(ob.buyOrders.Orders[:i], ob.buyOrders.Orders[i+1:]...)
-				return true
+	// 提取公共的移除逻辑
+	removeFromLevel := func(levels *[]*PriceLevel) bool {
+		for i := 0; i < len(*levels); i++ {
+			level := (*levels)[i]
+			for j, order := range level.Orders {
+				if order.ID == orderID {
+					level.Orders = append(level.Orders[:j], level.Orders[j+1:]...)
+					// 如果价格档位为空，移除该档位
+					if len(level.Orders) == 0 {
+						*levels = append((*levels)[:i], (*levels)[i+1:]...)
+					}
+					return true
+				}
 			}
 		}
+		return false
 	}
 
-	if ob.sellOrders != nil && ob.sellOrders.Orders != nil {
-		for i, order := range ob.sellOrders.Orders {
-			if order.ID == orderID {
-				ob.sellOrders.Orders = append(ob.sellOrders.Orders[:i], ob.sellOrders.Orders[i+1:]...)
-				return true
-			}
-		}
+	// 先检查买单
+	if removeFromLevel(&ob.buyLevels) {
+		return true
 	}
-
-	return false
+	// 再检查卖单
+	return removeFromLevel(&ob.sellLevels)
 }
 
-func (pl *PriceLevel) Add(order *Order) *PriceLevel {
-	if pl == nil {
-		return &PriceLevel{
-			Price:  order.Price,
-			Orders: []*Order{order},
-		}
+func ReleaseTrades(trades []*Trade) {
+	for _, t := range trades {
+		tradePool.Put(t)
 	}
-
-	if pl.Price.Equal(order.Price) {
-		pl.Orders = append(pl.Orders, order)
-		return pl
-	}
-
-	if (order.Side == OrderSideBuy && pl.Price.LessThan(order.Price)) ||
-		(order.Side == OrderSideSell && pl.Price.GreaterThan(order.Price)) {
-		return &PriceLevel{
-			Price:  order.Price,
-			Orders: []*Order{order},
-			Next:   pl,
-		}
-	}
-
-	pl.Next = pl.Next.Add(order)
-	return pl
 }

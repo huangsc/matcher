@@ -90,3 +90,19 @@ func (e *MatchEngine) handleMatch(order *Order) {
 		e.eventHandler.OnOrderUpdate(order)
 	}
 }
+
+func (e *MatchEngine) GetBuyOrders() []*Order {
+	orders := make([]*Order, 0)
+	for _, level := range e.orderBook.buyLevels {
+		orders = append(orders, level.Orders...)
+	}
+	return orders
+}
+
+func (e *MatchEngine) GetSellOrders() []*Order {
+	orders := make([]*Order, 0)
+	for _, level := range e.orderBook.sellLevels {
+		orders = append(orders, level.Orders...)
+	}
+	return orders
+}
